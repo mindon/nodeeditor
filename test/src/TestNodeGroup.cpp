@@ -1,0 +1,686 @@
+#include "ApplicationSetup.hpp"
+#include "LockableModel.hpp"
+#include "TestDelegateModels.hpp"
+
+#include <QtNodes/BasicGraphicsScene>
+#include <QtNodes/DataFlowGraphModel>
+#include <QtNodes/Definitions>
+#include <QtNodes/NodeDelegateModel>
+#include <QtNodes/NodeDelegateModelRegistry>
+#include <QtNodes/internal/ConnectionGraphicsObject.hpp>
+#include <QtNodes/internal/UndoCommands.hpp>
+#include <QtNodes/internal/NodeGraphicsObject.hpp>
+#include <QtNodes/internal/GroupGraphicsObject.hpp>
+#include <QtNodes/internal/NodeGroup.hpp>
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+#include <catch2/generators/catch_generators_adapters.hpp>
+#include <catch2/generators/catch_generators_range.hpp>
+
+#include <QCoreApplication>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QGraphicsSceneMouseEvent>
+#include <QPointF>
+#include <QSignalSpy>
+#include <QUndoStack>
+
+#include <algorithm>
+#include <memory>
+#include <set>
+#include <unordered_map>
+#include <vector>
+
+using QtNodes::BasicGraphicsScene;
+using QtNodes::ConnectionId;
+using QtNodes::DataFlowGraphModel;
+using QtNodes::GroupId;
+using QtNodes::NodeDelegateModel;
+using QtNodes::NodeDelegateModelRegistry;
+using QtNodes::NodeGraphicsObject;
+using QtNodes::NodeGroup;
+using QtNodes::NodeId;
+using QtNodes::NodeRole;
+using QtNodes::PortIndex;
+using QtNodes::PortType;
+
+namespace {
+std::unique_ptr<NodeDelegateModel> createDummyNode()
+{
+    return std::make_unique<StubDelegateModel>(QStringLiteral("DummyNode"),
+                                               QStringLiteral("Dummy Node"), 1, 1);
+}
+
+std::shared_ptr<NodeDelegateModelRegistry> createDummyRegistry()
+{
+    auto registry = std::make_shared<NodeDelegateModelRegistry>();
+    registry->registerModel(createDummyNode, QStringLiteral("Test"));
+    return registry;
+}
+
+NodeId createNode(DataFlowGraphModel &model, BasicGraphicsScene &scene)
+{
+    NodeId nodeId = model.addNode(QStringLiteral("DummyNode"));
+    REQUIRE(nodeId != QtNodes::InvalidNodeId);
+
+    QCoreApplication::processEvents();
+
+    auto *nodeObject = scene.nodeGraphicsObject(nodeId);
+    REQUIRE(nodeObject != nullptr);
+
+    return nodeId;
+}
+
+std::set<NodeId> toNodeIdSet(std::vector<NodeId> const &ids)
+{
+    return {ids.begin(), ids.end()};
+}
+
+} // namespace
+
+TEST_CASE("Node group creation", "[node-group]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    BasicGraphicsScene scene(model);
+    scene.setGroupingEnabled(true);
+
+    SECTION("Creating a group from a single node")
+    {
+        NodeId nodeId = createNode(model, scene);
+        auto *nodeObject = scene.nodeGraphicsObject(nodeId);
+        REQUIRE(nodeObject != nullptr);
+
+        std::vector<NodeGraphicsObject *> nodes{nodeObject};
+        auto groupWeak = scene.createGroup(nodes, QStringLiteral("SingleGroup"));
+        auto group = groupWeak.lock();
+
+        REQUIRE(group);
+        CHECK(scene.groups().size() == 1);
+        REQUIRE(group->childNodes().size() == 1);
+        CHECK(group->childNodes().front()->nodeId() == nodeId);
+
+        auto groupIds = group->nodeIDs();
+        REQUIRE(groupIds.size() == 1);
+        CHECK(groupIds.front() == nodeId);
+
+        auto nodeGroup = nodeObject->nodeGroup().lock();
+        REQUIRE(nodeGroup);
+        CHECK(nodeGroup->id() == group->id());
+    }
+
+    SECTION("Creating multiple groups and verifying membership")
+    {
+        constexpr std::size_t nodesPerGroup = 3;
+        constexpr std::size_t groupCount = 2;
+
+        std::vector<std::vector<NodeId>> expectedNodeIds(groupCount);
+        std::vector<GroupId> groupIds;
+
+        for (std::size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex) {
+            std::vector<NodeGraphicsObject *> nodeObjects;
+            nodeObjects.reserve(nodesPerGroup);
+            expectedNodeIds[groupIndex].reserve(nodesPerGroup);
+
+            for (std::size_t i = 0; i < nodesPerGroup; ++i) {
+                NodeId nodeId = createNode(model, scene);
+                expectedNodeIds[groupIndex].push_back(nodeId);
+                nodeObjects.push_back(scene.nodeGraphicsObject(nodeId));
+            }
+
+            auto groupWeak = scene.createGroup(nodeObjects,
+                                               QStringLiteral("Group%1").arg(groupIndex));
+            auto group = groupWeak.lock();
+            REQUIRE(group);
+            groupIds.push_back(group->id());
+        }
+
+        CHECK(scene.groups().size() == groupCount);
+
+        for (std::size_t index = 0; index < groupIds.size(); ++index) {
+            auto const &groupId = groupIds[index];
+            auto groupIt = scene.groups().find(groupId);
+            REQUIRE(groupIt != scene.groups().end());
+
+            auto const &group = groupIt->second;
+            REQUIRE(group);
+
+            auto const nodeIds = group->nodeIDs();
+            CHECK(toNodeIdSet(nodeIds) == toNodeIdSet(expectedNodeIds[index]));
+
+            for (auto *node : group->childNodes()) {
+                REQUIRE(node);
+                auto nodeGroup = node->nodeGroup().lock();
+                REQUIRE(nodeGroup);
+                CHECK(nodeGroup->id() == groupId);
+            }
+        }
+    }
+}
+
+TEST_CASE("Adding and removing nodes from a group", "[node-group]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    BasicGraphicsScene scene(model);
+    scene.setGroupingEnabled(true);
+
+    SECTION("Adding a node to an existing group")
+    {
+        NodeId firstNodeId = createNode(model, scene);
+        auto *firstNode = scene.nodeGraphicsObject(firstNodeId);
+        REQUIRE(firstNode != nullptr);
+
+        std::vector<NodeGraphicsObject *> nodes{firstNode};
+        auto group = scene.createGroup(nodes, QStringLiteral("ExtendableGroup")).lock();
+        REQUIRE(group);
+
+        NodeId extraNodeId = createNode(model, scene);
+        auto *extraNode = scene.nodeGraphicsObject(extraNodeId);
+        REQUIRE(extraNode != nullptr);
+
+        scene.addNodeToGroup(extraNodeId, group->id());
+
+        auto const groupIds = group->nodeIDs();
+        CHECK(groupIds.size() == 2);
+        CHECK(std::find(groupIds.begin(), groupIds.end(), extraNodeId) != groupIds.end());
+
+        auto nodeGroup = extraNode->nodeGroup().lock();
+        REQUIRE(nodeGroup);
+        CHECK(nodeGroup->id() == group->id());
+    }
+
+    SECTION("Removing nodes from a group and clearing empty groups")
+    {
+        std::vector<NodeGraphicsObject *> nodes;
+        std::vector<NodeId> nodeIds;
+        nodes.reserve(2);
+        nodeIds.reserve(2);
+
+        for (int i = 0; i < 2; ++i) {
+            NodeId id = createNode(model, scene);
+            nodeIds.push_back(id);
+            nodes.push_back(scene.nodeGraphicsObject(id));
+        }
+
+        auto group = scene.createGroup(nodes, QStringLiteral("RemovableGroup")).lock();
+        REQUIRE(group);
+        auto groupId = group->id();
+
+        scene.removeNodeFromGroup(nodeIds.front());
+        auto const remainingIds = group->nodeIDs();
+        CHECK(std::find(remainingIds.begin(), remainingIds.end(), nodeIds.front())
+              == remainingIds.end());
+
+        auto *removedNode = scene.nodeGraphicsObject(nodeIds.front());
+        REQUIRE(removedNode != nullptr);
+        CHECK(removedNode->nodeGroup().expired());
+
+        scene.removeNodeFromGroup(nodeIds.back());
+        CHECK(scene.groups().find(groupId) == scene.groups().end());
+    }
+
+    SECTION("Deleting grouped nodes updates the scene")
+    {
+        std::vector<NodeGraphicsObject *> nodes;
+        std::vector<NodeId> nodeIds;
+        nodes.reserve(2);
+        nodeIds.reserve(2);
+
+        for (int i = 0; i < 2; ++i) {
+            NodeId id = createNode(model, scene);
+            nodeIds.push_back(id);
+            nodes.push_back(scene.nodeGraphicsObject(id));
+        }
+
+        auto group = scene.createGroup(nodes, QStringLiteral("DeletionGroup")).lock();
+        REQUIRE(group);
+        auto groupId = group->id();
+
+        model.deleteNode(nodeIds.front());
+        QCoreApplication::processEvents();
+
+        CHECK(scene.groups().find(groupId) != scene.groups().end());
+
+        model.deleteNode(nodeIds.back());
+        QCoreApplication::processEvents();
+
+        CHECK(scene.groups().find(groupId) == scene.groups().end());
+        CHECK(scene.nodeGraphicsObject(nodeIds.front()) == nullptr);
+        CHECK(scene.nodeGraphicsObject(nodeIds.back()) == nullptr);
+    }
+}
+
+TEST_CASE("Saving and restoring node groups", "[node-group]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    BasicGraphicsScene scene(model);
+    scene.setGroupingEnabled(true);
+
+    SECTION("Saving a group serializes nodes and connections")
+    {
+        std::vector<NodeGraphicsObject *> nodeObjects;
+        std::vector<NodeId> nodeIds;
+        nodeObjects.reserve(2);
+        nodeIds.reserve(2);
+
+        for (int i = 0; i < 2; ++i) {
+            NodeId nodeId = createNode(model, scene);
+            nodeIds.push_back(nodeId);
+            nodeObjects.push_back(scene.nodeGraphicsObject(nodeId));
+            model.setNodeData(nodeId, NodeRole::Position, QPointF(100.0 * i, 50.0 * i));
+        }
+
+        auto group = scene.createGroup(nodeObjects, QStringLiteral("SerializableGroup")).lock();
+        REQUIRE(group);
+
+        ConnectionId connection{nodeIds[0], 0, nodeIds[1], 0};
+        model.addConnection(connection);
+        QCoreApplication::processEvents();
+
+        auto groupJson = QJsonDocument::fromJson(group->saveToFile()).object();
+        CHECK(groupJson["name"].toString() == QStringLiteral("SerializableGroup"));
+        CHECK(static_cast<GroupId>(groupJson["id"].toInt()) == group->id());
+
+        auto nodesJson = groupJson["nodes"].toArray();
+        CHECK(nodesJson.size() == 2);
+
+        std::set<NodeId> serializedIds;
+        for (auto const &nodeValue : nodesJson) {
+            auto nodeObject = nodeValue.toObject();
+            NodeId serializedId = static_cast<NodeId>(nodeObject["id"].toInt());
+            serializedIds.insert(serializedId);
+            CHECK(nodeObject.contains("position"));
+        }
+        CHECK(serializedIds == toNodeIdSet(nodeIds));
+
+        auto connectionsJson = groupJson["connections"].toArray();
+        CHECK(connectionsJson.size() == 1);
+
+        auto connectionObject = connectionsJson.first().toObject();
+        CHECK(static_cast<NodeId>(connectionObject["outNodeId"].toInt()) == nodeIds[0]);
+        CHECK(static_cast<NodeId>(connectionObject["inNodeId"].toInt()) == nodeIds[1]);
+    }
+
+    SECTION("Restoring a group from serialized data")
+    {
+        std::vector<NodeGraphicsObject *> nodeObjects;
+        std::vector<NodeId> nodeIds;
+        nodeObjects.reserve(2);
+        nodeIds.reserve(2);
+
+        for (int i = 0; i < 2; ++i) {
+            NodeId nodeId = createNode(model, scene);
+            nodeIds.push_back(nodeId);
+            nodeObjects.push_back(scene.nodeGraphicsObject(nodeId));
+            model.setNodeData(nodeId, NodeRole::Position, QPointF(150.0 * i, 60.0 * i));
+        }
+
+        auto group = scene.createGroup(nodeObjects, QStringLiteral("OriginalGroup")).lock();
+        REQUIRE(group);
+
+        ConnectionId connection{nodeIds[0], 0, nodeIds[1], 0};
+        model.addConnection(connection);
+        QCoreApplication::processEvents();
+
+        auto groupJson = QJsonDocument::fromJson(group->saveToFile()).object();
+
+        auto newRegistry = createDummyRegistry();
+        DataFlowGraphModel newModel(newRegistry);
+        BasicGraphicsScene newScene(newModel);
+        newScene.setGroupingEnabled(true);
+
+        auto [restoredGroupWeak, idMapping] = newScene.restoreGroup(groupJson);
+        auto restoredGroup = restoredGroupWeak.lock();
+        REQUIRE(restoredGroup);
+
+        CHECK(newScene.groups().find(restoredGroup->id()) != newScene.groups().end());
+
+        auto restoredIds = restoredGroup->nodeIDs();
+        CHECK(restoredIds.size() == nodeIds.size());
+
+        for (auto originalId : nodeIds) {
+            auto mappingIt = idMapping.find(static_cast<GroupId>(originalId));
+            REQUIRE(mappingIt != idMapping.end());
+            NodeId restoredId = static_cast<NodeId>(mappingIt->second);
+            CHECK(std::find(restoredIds.begin(), restoredIds.end(), restoredId)
+                  != restoredIds.end());
+        }
+
+        REQUIRE_FALSE(restoredIds.empty());
+        auto connections = newModel.allConnectionIds(restoredIds.front());
+        REQUIRE_FALSE(connections.empty());
+
+        auto connectionIt = connections.begin();
+        std::set<NodeId> restoredSet(restoredIds.begin(), restoredIds.end());
+        CHECK(restoredSet.count(connectionIt->outNodeId) == 1);
+        CHECK(restoredSet.count(connectionIt->inNodeId) == 1);
+    }
+}
+
+TEST_CASE("Dragging a group moves its nodes through the model", "[node-group][drag]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    BasicGraphicsScene scene(model);
+    scene.setGroupingEnabled(true);
+
+    NodeId const inGroup1 = createNode(model, scene);
+    NodeId const inGroup2 = createNode(model, scene);
+    NodeId const outside = createNode(model, scene);
+    model.setNodeData(inGroup1, NodeRole::Position, QPointF(0, 0));
+    model.setNodeData(inGroup2, NodeRole::Position, QPointF(200, 0));
+    model.setNodeData(outside, NodeRole::Position, QPointF(0, 300));
+
+    std::vector<NodeGraphicsObject *> nodes{scene.nodeGraphicsObject(inGroup1),
+                                            scene.nodeGraphicsObject(inGroup2)};
+    auto group = scene.createGroup(nodes, QStringLiteral("Dragged")).lock();
+    REQUIRE(group);
+
+    QPointF const diff(10, 5);
+    QGraphicsSceneMouseEvent move(QEvent::GraphicsSceneMouseMove);
+    move.setPos(diff);
+    move.setLastPos(QPointF(0, 0));
+    scene.sendEvent(&group->groupGraphicsObject(), &move);
+
+    auto position = [&](NodeId id) { return model.nodeData(id, NodeRole::Position).value<QPointF>(); };
+
+    SECTION("Group nodes reach the model, other nodes stay")
+    {
+        CHECK(position(inGroup1) == QPointF(0, 0) + diff);
+        CHECK(position(inGroup2) == QPointF(200, 0) + diff);
+        CHECK(position(outside) == QPointF(0, 300));
+        CHECK(scene.nodeGraphicsObject(inGroup1)->pos() == position(inGroup1));
+    }
+
+    SECTION("The move is undoable")
+    {
+        REQUIRE(scene.undoStack().count() == 1);
+        scene.undoStack().undo();
+        CHECK(position(inGroup1) == QPointF(0, 0));
+        CHECK(position(inGroup2) == QPointF(200, 0));
+    }
+
+    SECTION("A selected node outside the group moves together with it")
+    {
+        scene.nodeGraphicsObject(outside)->setSelected(true);
+        scene.sendEvent(&group->groupGraphicsObject(), &move);
+
+        CHECK(position(outside) == QPointF(0, 300) + diff);
+        CHECK(position(inGroup1) == QPointF(0, 0) + diff * 2);
+    }
+}
+
+TEST_CASE("A mouse move on a node of a locked group moves nothing", "[node-group][drag]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    BasicGraphicsScene scene(model);
+    scene.setGroupingEnabled(true);
+
+    NodeId const a = createNode(model, scene);
+    NodeId const b = createNode(model, scene);
+    model.setNodeData(a, NodeRole::Position, QPointF(0, 0));
+    model.setNodeData(b, NodeRole::Position, QPointF(200, 0));
+
+    std::vector<NodeGraphicsObject *> nodes{scene.nodeGraphicsObject(a),
+                                            scene.nodeGraphicsObject(b)};
+    auto group = scene.createGroup(nodes, QStringLiteral("Locked")).lock();
+    REQUIRE(group);
+    group->groupGraphicsObject().lock(true);
+
+    QGraphicsSceneMouseEvent move(QEvent::GraphicsSceneMouseMove);
+    move.setPos(QPointF(10, 5));
+    move.setLastPos(QPointF(0, 0));
+    scene.sendEvent(scene.nodeGraphicsObject(a), &move);
+
+    CHECK(model.nodeData(a, NodeRole::Position).value<QPointF>() == QPointF(0, 0));
+    CHECK(model.nodeData(b, NodeRole::Position).value<QPointF>() == QPointF(200, 0));
+}
+
+namespace {
+void pressPort(BasicGraphicsScene &scene, NodeId nodeId, PortType type)
+{
+    auto *item = scene.nodeGraphicsObject(nodeId);
+    QPointF const portPos = scene.nodeGeometry().portPosition(nodeId, type, 0);
+
+    QGraphicsSceneMouseEvent press(QEvent::GraphicsSceneMousePress);
+    press.setButton(Qt::LeftButton);
+    press.setPos(portPos);
+    press.setScenePos(item->mapToScene(portPos));
+    scene.sendEvent(item, &press);
+}
+
+int countConnectionItems(BasicGraphicsScene &scene)
+{
+    int count = 0;
+    for (QGraphicsItem *item : scene.items()) {
+        if (dynamic_cast<QtNodes::ConnectionGraphicsObject *>(item))
+            ++count;
+    }
+    return count;
+}
+} // namespace
+
+TEST_CASE("A model-locked node does not start a draft connection", "[node-lock]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    LockableModel<DataFlowGraphModel> model(registry);
+    BasicGraphicsScene scene(model);
+
+    NodeId const a = createNode(model, scene);
+    model.setLocked(a, true);
+
+    pressPort(scene, a, PortType::Out);
+
+    CHECK(countConnectionItems(scene) == 0);
+}
+
+TEST_CASE("A model-locked node does not detach a connection", "[node-lock]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    LockableModel<DataFlowGraphModel> model(registry);
+    BasicGraphicsScene scene(model);
+
+    NodeId const a = createNode(model, scene);
+    NodeId const b = createNode(model, scene);
+    ConnectionId const connection{a, 0, b, 0};
+    model.addConnection(connection);
+    QCoreApplication::processEvents();
+    REQUIRE(model.connectionExists(connection));
+
+    model.setLocked(b, true);
+    pressPort(scene, b, PortType::In);
+
+    CHECK(model.connectionExists(connection));
+}
+
+TEST_CASE("A node stays unselectable while its model lock or its group lock is set", "[node-lock]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    LockableModel<DataFlowGraphModel> model(registry);
+    BasicGraphicsScene scene(model);
+    scene.setGroupingEnabled(true);
+
+    NodeId const a = createNode(model, scene);
+    NodeId const b = createNode(model, scene);
+    auto *item = scene.nodeGraphicsObject(a);
+    auto selectable = [&] { return bool(item->flags() & QGraphicsItem::ItemIsSelectable); };
+
+    REQUIRE(selectable());
+
+    std::vector<NodeGraphicsObject *> nodes{item, scene.nodeGraphicsObject(b)};
+    auto group = scene.createGroup(nodes, QStringLiteral("Locked")).lock();
+    REQUIRE(group);
+    group->groupGraphicsObject().lock(true);
+    REQUIRE_FALSE(selectable());
+
+    SECTION("Unlocking the model flag keeps the group lock")
+    {
+        model.setLocked(a, true);
+        model.setLocked(a, false);
+        CHECK_FALSE(selectable());
+    }
+
+    SECTION("Unlocking the group keeps the model lock")
+    {
+        model.setLocked(a, true);
+        group->groupGraphicsObject().lock(false);
+        CHECK_FALSE(selectable());
+    }
+
+    SECTION("Removing the node from its group keeps the model lock")
+    {
+        model.setLocked(a, true);
+        scene.removeNodeFromGroup(a);
+        CHECK_FALSE(selectable());
+    }
+
+    SECTION("With both locks gone the node is selectable")
+    {
+        group->groupGraphicsObject().lock(false);
+        CHECK(selectable());
+    }
+}
+
+TEST_CASE("A model reset with a group does not leave dangling group items", "[node-group][lifetime]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    auto scene = std::make_unique<BasicGraphicsScene>(model);
+    scene->setGroupingEnabled(true);
+
+    NodeId const a = createNode(model, *scene);
+    NodeId const b = createNode(model, *scene);
+    std::vector<NodeGraphicsObject *> nodes{scene->nodeGraphicsObject(a),
+                                            scene->nodeGraphicsObject(b)};
+    REQUIRE(scene->createGroup(nodes, QStringLiteral("Reset")).lock());
+
+    // Changing the orientation resets the model view of the scene.
+    scene->setOrientation(Qt::Vertical);
+
+    CHECK(scene->groups().empty());
+
+    // Destroying the scene used to delete the group item a second time.
+    scene.reset();
+}
+
+TEST_CASE("A node is in at most one group", "[node-group][lifetime]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    BasicGraphicsScene scene(model);
+    scene.setGroupingEnabled(true);
+
+    NodeId const a = createNode(model, scene);
+    NodeId const b = createNode(model, scene);
+    NodeId const c = createNode(model, scene);
+    NodeId const d = createNode(model, scene);
+
+    std::vector<NodeGraphicsObject *> first{scene.nodeGraphicsObject(a),
+                                            scene.nodeGraphicsObject(b)};
+    std::vector<NodeGraphicsObject *> second{scene.nodeGraphicsObject(c),
+                                             scene.nodeGraphicsObject(d)};
+    auto group1 = scene.createGroup(first, QStringLiteral("First")).lock();
+    auto group2 = scene.createGroup(second, QStringLiteral("Second")).lock();
+    REQUIRE(group1);
+    REQUIRE(group2);
+
+    SECTION("Adding a node to its own group does not duplicate it")
+    {
+        scene.addNodeToGroup(a, group1->id());
+
+        CHECK(toNodeIdSet(group1->nodeIDs()) == std::set<NodeId>{a, b});
+        CHECK(group1->childNodes().size() == 2);
+    }
+
+    SECTION("Adding a node to another group removes it from the old one")
+    {
+        scene.addNodeToGroup(a, group2->id());
+
+        CHECK(toNodeIdSet(group1->nodeIDs()) == std::set<NodeId>{b});
+        CHECK(toNodeIdSet(group2->nodeIDs()) == std::set<NodeId>{a, c, d});
+        CHECK(scene.nodeGraphicsObject(a)->nodeGroup().lock() == group2);
+    }
+
+    SECTION("Moving the last node out of a group removes the empty group")
+    {
+        scene.addNodeToGroup(a, group2->id());
+        scene.addNodeToGroup(b, group2->id());
+
+        CHECK(scene.groups().count(group1->id()) == 0);
+        CHECK(toNodeIdSet(group2->nodeIDs()) == std::set<NodeId>{a, b, c, d});
+    }
+}
+
+TEST_CASE("A group does not have the scene as QObject parent", "[node-group][lifetime]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    auto scene = std::make_unique<BasicGraphicsScene>(model);
+    scene->setGroupingEnabled(true);
+
+    NodeId const a = createNode(model, *scene);
+    std::vector<NodeGraphicsObject *> nodes{scene->nodeGraphicsObject(a)};
+    auto group = scene->createGroup(nodes, QStringLiteral("Owned")).lock();
+    REQUIRE(group);
+
+    // The scene holds the group in a shared_ptr. A QObject parent would delete it a second time.
+    CHECK(group->parent() == nullptr);
+
+    // A group kept past the life of the scene is released without a crash.
+    scene.reset();
+    group.reset();
+}
+
+TEST_CASE("Undo of a move skips nodes that no longer exist", "[node-group][lifetime]")
+{
+    auto app = applicationSetup();
+
+    auto registry = createDummyRegistry();
+    DataFlowGraphModel model(registry);
+    BasicGraphicsScene scene(model);
+
+    NodeId const a = createNode(model, scene);
+    NodeId const b = createNode(model, scene);
+    model.setNodeData(a, NodeRole::Position, QPointF(0, 0));
+    model.setNodeData(b, NodeRole::Position, QPointF(100, 0));
+
+    scene.undoStack().push(new QtNodes::MoveNodeCommand(&scene, {a, b}, QPointF(10, 0)));
+
+    // Deleted outside the undo stack.
+    model.deleteNode(b);
+
+    QSignalSpy spy(&model, &DataFlowGraphModel::nodePositionUpdated);
+    scene.undoStack().undo();
+
+    REQUIRE(spy.count() == 1);
+    CHECK(spy.at(0).at(0).value<NodeId>() == a);
+    CHECK(model.nodeData(a, NodeRole::Position).value<QPointF>() == QPointF(0, 0));
+    CHECK_FALSE(model.nodeExists(b));
+}

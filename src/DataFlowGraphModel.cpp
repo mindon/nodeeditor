@@ -1,8 +1,11 @@
 #include "DataFlowGraphModel.hpp"
+
 #include "ConnectionIdHash.hpp"
+#include "Definitions.hpp"
 
 #include <QJsonArray>
 
+#include <stack>
 #include <stdexcept>
 
 namespace QtNodes {
@@ -98,7 +101,14 @@ NodeId DataFlowGraphModel::addNode(QString const nodeType)
                 this,
                 &DataFlowGraphModel::portsInserted);
 
+        connect(model.get(), &NodeDelegateModel::requestNodeUpdate, this, [newId, this]() {
+            Q_EMIT nodeUpdated(newId);
+        });
+
         _models[newId] = std::move(model);
+
+        _labels[newId] = _models[newId]->label();
+        _labelsVisible[newId] = _models[newId]->labelVisible();
 
         Q_EMIT nodeCreated(newId);
 
@@ -110,6 +120,22 @@ NodeId DataFlowGraphModel::addNode(QString const nodeType)
 
 bool DataFlowGraphModel::connectionPossible(ConnectionId const connectionId) const
 {
+    // Check if nodes exist
+    if (!nodeExists(connectionId.outNodeId) || !nodeExists(connectionId.inNodeId)) {
+        return false;
+    }
+
+    // Check port bounds, i.e. that we do not connect non-existing port numbers
+    auto checkPortBounds = [&](PortType const portType) {
+        NodeId const nodeId = getNodeId(portType, connectionId);
+        auto portCountRole = (portType == PortType::Out) ? NodeRole::OutPortCount
+                                                         : NodeRole::InPortCount;
+
+        std::size_t const portCount = nodeData(nodeId, portCountRole).toUInt();
+
+        return getPortIndex(portType, connectionId) < portCount;
+    };
+
     auto getDataType = [&](PortType const portType) {
         return portData(getNodeId(portType, connectionId),
                         portType,
@@ -129,8 +155,42 @@ bool DataFlowGraphModel::connectionPossible(ConnectionId const connectionId) con
         return connected.empty() || (policy == ConnectionPolicy::Many);
     };
 
-    return getDataType(PortType::Out).id == getDataType(PortType::In).id
-           && portVacant(PortType::Out) && portVacant(PortType::In);
+    bool const basicChecks = getDataType(PortType::Out).id == getDataType(PortType::In).id
+                             && portVacant(PortType::Out) && portVacant(PortType::In)
+                             && checkPortBounds(PortType::Out) && checkPortBounds(PortType::In);
+
+    // In data-flow mode (this class) it's important to forbid graph loops.
+    // We perform depth-first graph traversal starting from the "Input" port of
+    // the given connection. We should never encounter the starting "Out" node.
+
+    auto hasLoops = [this, &connectionId]() -> bool {
+        std::stack<NodeId> filo;
+        filo.push(connectionId.inNodeId);
+
+        while (!filo.empty()) {
+            auto id = filo.top();
+            filo.pop();
+
+            if (id == connectionId.outNodeId) { // LOOP!
+                return true;
+            }
+
+            // Add out-connections to continue interations
+            std::size_t const nOutPorts = nodeData(id, NodeRole::OutPortCount).toUInt();
+
+            for (PortIndex index = 0; index < nOutPorts; ++index) {
+                auto const &outConnectionIds = connections(id, PortType::Out, index);
+
+                for (auto cid : outConnectionIds) {
+                    filo.push(cid.inNodeId);
+                }
+            }
+        }
+
+        return false;
+    };
+
+    return basicChecks && (loopsEnabled() || !hasLoops());
 }
 
 void DataFlowGraphModel::addConnection(ConnectionId const connectionId)
@@ -216,18 +276,22 @@ QVariant DataFlowGraphModel::nodeData(NodeId nodeId, NodeRole role) const
         break;
 
     case NodeRole::Style: {
+        /*
         auto style = StyleCollection::nodeStyle();
         QVariantMap m = style.toJson().toVariantMap();
         if (!_styles.empty() && _styles.find(nodeId) != _styles.end()) {
             m.insert(QVariantMap{{"NodeStyle",_styles.at(nodeId).get()->toVariantMap()}});
         }
         result = m;
+        */
+        auto style = model->nodeStyle();
+        result = style.toJson().toVariantMap();
     } break;
 
     case NodeRole::InternalData: {
         QJsonObject nodeJson;
 
-        nodeJson["internal-data"] = _models.at(nodeId)->save();
+        nodeJson["internal-data"] = model->save();
 
         result = nodeJson.toVariantMap();
         break;
@@ -242,9 +306,38 @@ QVariant DataFlowGraphModel::nodeData(NodeId nodeId, NodeRole role) const
         break;
 
     case NodeRole::Widget: {
-        auto w = model->embeddedWidget();
+        auto *w = model->embeddedWidget();
         result = QVariant::fromValue(w);
     } break;
+
+    case NodeRole::ValidationState: {
+        auto validationState = model->validationState();
+        result = QVariant::fromValue(validationState);
+    } break;
+
+    case NodeRole::LabelVisible: {
+        auto const labelVisibleIt = _labelsVisible.find(nodeId);
+        result = (labelVisibleIt != _labelsVisible.end()) ? labelVisibleIt->second
+                                                          : model->labelVisible();
+    } break;
+
+    case NodeRole::Label: {
+        auto const labelIt = _labels.find(nodeId);
+        result = (labelIt != _labels.end()) ? labelIt->second : model->label();
+    } break;
+
+    case NodeRole::LabelEditable:
+        result = model->labelEditable();
+        break;
+
+    case NodeRole::ProcessingStatus: {
+        auto processingStatus = model->processingStatus();
+        result = QVariant::fromValue(processingStatus);
+    } break;
+
+    case NodeRole::ProgressValue:
+        result = model->progressValue();
+        break;
     }
 
     return result;
@@ -305,6 +398,44 @@ bool DataFlowGraphModel::setNodeData(NodeId nodeId, NodeRole role, QVariant valu
 
     case NodeRole::Widget:
         break;
+
+    case NodeRole::ValidationState: {
+        if (value.canConvert<NodeValidationState>()) {
+            auto state = value.value<NodeValidationState>();
+            if (auto node = delegateModel<NodeDelegateModel>(nodeId); node != nullptr) {
+                node->setValidationState(state);
+            }
+        }
+        Q_EMIT nodeUpdated(nodeId);
+    } break;
+
+    case NodeRole::ProcessingStatus: {
+        if (value.canConvert<QtNodes::NodeProcessingStatus>()) {
+            auto status = value.value<QtNodes::NodeProcessingStatus>();
+            if (auto node = delegateModel<NodeDelegateModel>(nodeId); node != nullptr) {
+                node->setNodeProcessingStatus(status);
+            }
+        }
+        Q_EMIT nodeUpdated(nodeId);
+    } break;
+
+    case NodeRole::LabelVisible: {
+        _labelsVisible[nodeId] = value.toBool();
+        Q_EMIT nodeUpdated(nodeId);
+        result = true;
+    } break;
+
+    case NodeRole::Label: {
+        _labels[nodeId] = value.toString();
+        Q_EMIT nodeUpdated(nodeId);
+        result = true;
+    } break;
+
+    case NodeRole::LabelEditable:
+        break;
+
+    case NodeRole::ProgressValue:
+        break;
     }
 
     return result;
@@ -325,8 +456,9 @@ QVariant DataFlowGraphModel::portData(NodeId nodeId,
 
     switch (role) {
     case PortRole::Data:
-        if (portType == PortType::Out)
+        if (portType == PortType::Out) {
             result = QVariant::fromValue(model->outData(portIndex));
+        }
         break;
 
     case PortRole::DataType:
@@ -366,6 +498,9 @@ bool DataFlowGraphModel::setPortData(
     switch (role) {
     case PortRole::Data:
         if (portType == PortType::In) {
+            if (model->frozen())
+                return false;
+
             model->setInData(value.value<std::shared_ptr<NodeData>>(), portIndex);
 
             // Triggers repainting on the scene.
@@ -411,6 +546,8 @@ bool DataFlowGraphModel::deleteNode(NodeId const nodeId)
     }
 
     _nodeGeometryData.erase(nodeId);
+    _labels.erase(nodeId);
+    _labelsVisible.erase(nodeId);
     _models.erase(nodeId);
     if (!_styles.empty() && _styles.find(nodeId) != _styles.end())
         _styles.erase(nodeId);
@@ -424,9 +561,22 @@ QJsonObject DataFlowGraphModel::saveNode(NodeId const nodeId) const
 {
     QJsonObject nodeJson;
 
-    nodeJson["id"] = static_cast<qint64>(nodeId);
+    auto const modelIt = _models.find(nodeId);
+    if (modelIt == _models.end()) {
+        return nodeJson;
+    }
 
-    nodeJson["internal-data"] = _models.at(nodeId)->save();
+    auto const &model = modelIt->second;
+
+    nodeJson["id"] = static_cast<qint64>(nodeId);
+    nodeJson["internal-data"] = model->save();
+
+    auto const labelIt = _labels.find(nodeId);
+    nodeJson["label"] = (labelIt != _labels.end()) ? labelIt->second : model->label();
+
+    auto const labelVisibleIt = _labelsVisible.find(nodeId);
+    nodeJson["labelVisible"] = (labelVisibleIt != _labelsVisible.end()) ? labelVisibleIt->second
+                                                                        : model->labelVisible();
 
     {
         QPointF const pos = nodeData(nodeId, NodeRole::Position).value<QPointF>();
@@ -468,7 +618,7 @@ void DataFlowGraphModel::loadNode(QJsonObject const &nodeJson)
     // loading.
     // 2. When undoing the deletion command.  Conflict is not possible
     // because all the new ids were created past the removed nodes.
-    NodeId restoredNodeId = nodeJson["id"].toInt();
+    NodeId restoredNodeId = jsonValueToUInt32(nodeJson["id"]);
 
     _nextNodeId = std::max(_nextNodeId, restoredNodeId + 1);
 
@@ -485,6 +635,36 @@ void DataFlowGraphModel::loadNode(QJsonObject const &nodeJson)
                     onOutPortDataUpdated(restoredNodeId, portIndex);
                 });
 
+        connect(model.get(),
+                &NodeDelegateModel::portsAboutToBeDeleted,
+                this,
+                [restoredNodeId,
+                 this](PortType const portType, PortIndex const first, PortIndex const last) {
+                    portsAboutToBeDeleted(restoredNodeId, portType, first, last);
+                });
+
+        connect(model.get(),
+                &NodeDelegateModel::portsDeleted,
+                this,
+                &DataFlowGraphModel::portsDeleted);
+
+        connect(model.get(),
+                &NodeDelegateModel::portsAboutToBeInserted,
+                this,
+                [restoredNodeId,
+                 this](PortType const portType, PortIndex const first, PortIndex const last) {
+                    portsAboutToBeInserted(restoredNodeId, portType, first, last);
+                });
+
+        connect(model.get(),
+                &NodeDelegateModel::portsInserted,
+                this,
+                &DataFlowGraphModel::portsInserted);
+
+        connect(model.get(), &NodeDelegateModel::requestNodeUpdate, this, [restoredNodeId, this]() {
+            Q_EMIT nodeUpdated(restoredNodeId);
+        });
+
         _models[restoredNodeId] = std::move(model);
 
         Q_EMIT nodeCreated(restoredNodeId);
@@ -494,12 +674,19 @@ void DataFlowGraphModel::loadNode(QJsonObject const &nodeJson)
 
         setNodeData(restoredNodeId, NodeRole::Position, pos);
 
+        auto *restoredModel = _models[restoredNodeId].get();
+
+        _labels[restoredNodeId] = nodeJson["label"].toString(restoredModel->label());
+        _labelsVisible[restoredNodeId] = nodeJson.contains("labelVisible")
+                                             ? nodeJson["labelVisible"].toBool()
+                                             : restoredModel->labelVisible();
+
         if (nodeJson.contains("style")) {
             QJsonObject styleJson = nodeJson["style"].toObject();
             setNodeData(restoredNodeId, NodeRole::Style, styleJson);
         }
 
-        _models[restoredNodeId]->load(internalDataJson);
+        restoredModel->load(internalDataJson);
     } else {
         throw std::logic_error(std::string("No registered model with name ")
                                + delegateModelName.toLocal8Bit().data());

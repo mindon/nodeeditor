@@ -1,5 +1,6 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.13)
 
+cmake_policy(SET CMP0077 NEW) # new in 3.13. The NEW behavior of this policy is that option() keeps a normal variable set by the parent project, such as BUILD_SHARED_LIBS.
 cmake_policy(SET CMP0072 NEW) # new in 3.11. The NEW behavior for this policy is to set OpenGL_GL_PREFERENCE to GLVND.
 cmake_policy(SET CMP0068 NEW) # new in 3.9. The NEW behavior of this policy is to ignore the RPATH settings for install_name on macOS.
 
@@ -12,6 +13,10 @@ set(CMAKE_DISABLE_IN_SOURCE_BUILD ON)
 set(CMAKE_DISABLE_SOURCE_CHANGES  ON)
 set(OpenGL_GL_PREFERENCE LEGACY)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Enable AUTOMOC globally for all targets (needed for examples with Q_OBJECT)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 get_directory_property(_has_parent PARENT_DIRECTORY)
 if(_has_parent)
@@ -29,8 +34,6 @@ option(BUILD_SHARED_LIBS "Build as shared library" ON)
 option(BUILD_DEBUG_POSTFIX_D "Append d suffix to debug libraries" OFF)
 option(QT_NODES_FORCE_TEST_COLOR "Force colorized unit test output" OFF)
 option(USE_QT6 "Build with Qt6 (Enabled by default)" ON)
-
-enable_testing()
 
 if(QT_NODES_DEVELOPER_DEFAULTS)
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
@@ -60,44 +63,38 @@ if (${QT_VERSION} VERSION_LESS 5.11.0)
   message(FATAL_ERROR "Requires qt version >= 5.11.0, Your current version is ${QT_VERSION}")
 endif()
 
-if (${QT_VERSION_MAJOR} EQUAL 6)
-  qt_add_resources(RESOURCES ./resources/resources.qrc)
-else()
-  qt5_add_resources(RESOURCES ./resources/resources.qrc)
-endif()
-
-# Unfortunately, as we have a split include/src, AUTOMOC doesn't work.
-# We'll have to manually specify some files
-set(CMAKE_AUTOMOC ON)
-
 set(CPP_SOURCE_FILES
   src/AbstractGraphModel.cpp
   src/AbstractNodeGeometry.cpp
   src/BasicGraphicsScene.cpp
   src/ConnectionGraphicsObject.cpp
-  src/ConnectionPainter.cpp
   src/ConnectionState.cpp
   src/ConnectionStyle.cpp
   src/DataFlowGraphModel.cpp
   src/DataFlowGraphicsScene.cpp
+  src/DefaultConnectionPainter.cpp
   src/DefaultHorizontalNodeGeometry.cpp
+  src/DefaultNodePainter.cpp
   src/DefaultVerticalNodeGeometry.cpp
   src/Definitions.cpp
   src/GraphicsView.cpp
   src/GraphicsViewStyle.cpp
-  src/NodeDelegateModelRegistry.cpp
   src/NodeConnectionInteraction.cpp
   src/NodeDelegateModel.cpp
+  src/NodeDelegateModelRegistry.cpp
   src/NodeGraphicsObject.cpp
-  src/DefaultNodePainter.cpp
   src/NodeState.cpp
   src/NodeStyle.cpp
   src/StyleCollection.cpp
   src/UndoCommands.cpp
   src/locateNode.cpp
+  src/GroupGraphicsObject.cpp
+  src/NodeGroup.cpp
+  resources/resources.qrc
 )
 
 set(HPP_HEADER_FILES
+  include/QtNodes/internal/AbstractConnectionPainter.hpp
   include/QtNodes/internal/AbstractGraphModel.hpp
   include/QtNodes/internal/AbstractNodeGeometry.hpp
   include/QtNodes/internal/AbstractNodePainter.hpp
@@ -110,7 +107,6 @@ set(HPP_HEADER_FILES
   include/QtNodes/internal/ConnectionStyle.hpp
   include/QtNodes/internal/DataFlowGraphicsScene.hpp
   include/QtNodes/internal/DataFlowGraphModel.hpp
-  include/QtNodes/internal/DefaultNodePainter.hpp
   include/QtNodes/internal/Definitions.hpp
   include/QtNodes/internal/Export.hpp
   include/QtNodes/internal/GraphicsView.hpp
@@ -128,11 +124,14 @@ set(HPP_HEADER_FILES
   include/QtNodes/internal/Serializable.hpp
   include/QtNodes/internal/Style.hpp
   include/QtNodes/internal/StyleCollection.hpp
-  src/ConnectionPainter.hpp
-  src/DefaultHorizontalNodeGeometry.hpp
-  src/DefaultVerticalNodeGeometry.hpp
-  src/NodeConnectionInteraction.hpp
-  src/UndoCommands.hpp
+  include/QtNodes/internal/DefaultConnectionPainter.hpp
+  include/QtNodes/internal/DefaultHorizontalNodeGeometry.hpp
+  include/QtNodes/internal/DefaultNodePainter.hpp
+  include/QtNodes/internal/DefaultVerticalNodeGeometry.hpp
+  include/QtNodes/internal/NodeConnectionInteraction.hpp
+  include/QtNodes/internal/UndoCommands.hpp
+  include/QtNodes/internal/NodeGroup.hpp
+  include/QtNodes/internal/GroupGraphicsObject.hpp
 )
 
 # If we want to give the option to build a static library,
@@ -140,7 +139,6 @@ set(HPP_HEADER_FILES
 add_library(QtNodes
   ${CPP_SOURCE_FILES}
   ${HPP_HEADER_FILES}
-  ${RESOURCES}
 )
 
 add_library(QtNodes::QtNodes ALIAS QtNodes)
@@ -165,13 +163,16 @@ target_link_libraries(QtNodes
 
 target_compile_definitions(QtNodes
   PUBLIC
-    NODE_EDITOR_SHARED
+    $<IF:$<BOOL:${BUILD_SHARED_LIBS}>, NODE_EDITOR_SHARED, NODE_EDITOR_STATIC>
   PRIVATE
     NODE_EDITOR_EXPORTS
     #NODE_DEBUG_DRAWING
     QT_NO_KEYWORDS
 )
 
+if(MSVC)
+  string(REGEX REPLACE "/W[0-4]" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
 
 target_compile_options(QtNodes
   PRIVATE
@@ -188,7 +189,7 @@ if(NOT "${CMAKE_CXX_SIMULATE_ID}" STREQUAL "MSVC")
 endif()
 
 if(QT_NODES_DEVELOPER_DEFAULTS)
-  target_compile_features(QtNodes PUBLIC cxx_std_14)
+  target_compile_features(QtNodes PUBLIC cxx_std_17)
   set_target_properties(QtNodes PROPERTIES CXX_EXTENSIONS OFF)
 endif()
 
@@ -199,28 +200,6 @@ set_target_properties(QtNodes
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
-
-######
-# Moc
-##
-
-file(GLOB_RECURSE HEADERS_TO_MOC include/QtNodes/internal/*.hpp)
-
-if (${QT_VERSION_MAJOR} EQUAL 6)
-  qt_wrap_cpp(nodes_moc
-      ${HEADERS_TO_MOC}
-      TARGET QtNodes
-    OPTIONS --no-notes # Don't display a note for the headers which don't produce a moc_*.cpp
-  )
-else()
-  qt5_wrap_cpp(nodes_moc
-  ${HEADERS_TO_MOC}
-  TARGET QtNodes
-  OPTIONS --no-notes # Don't display a note for the headers which don't produce a moc_*.cpp
-  )
-endif()
-
-target_sources(QtNodes PRIVATE ${nodes_moc})
 
 ###########
 # Examples
@@ -237,9 +216,11 @@ endif()
 ##################
 # Automated Tests
 ##
+enable_testing()
+
 
 if(BUILD_TESTING)
-  #add_subdirectory(test)
+  add_subdirectory(test)
 endif()
 
 ###############

@@ -1,8 +1,14 @@
 #pragma once
 
+#include "NodeDelegateModel.hpp"
+#include "NodeGroup.hpp"
+#include "NodeState.hpp"
+#include <QIcon>
+#include <QRectF>
 #include <QtCore/QUuid>
 #include <QtWidgets/QGraphicsObject>
 
+#include "Export.hpp"
 #include "NodeState.hpp"
 
 class QGraphicsProxyWidget;
@@ -11,8 +17,11 @@ namespace QtNodes {
 
 class BasicGraphicsScene;
 class AbstractGraphModel;
+class NodeGroup;
+class NodeDelegateModel;
+class GroupGraphicsObject;
 
-class NodeGraphicsObject : public QGraphicsObject
+class NODE_EDITOR_PUBLIC NodeGraphicsObject : public QGraphicsObject
 {
     Q_OBJECT
 public:
@@ -51,6 +60,24 @@ public:
     void reactToConnection(ConnectionGraphicsObject const *cgo);
 
     void nodeFlagsUpdated(NodeId const nodeId);
+    /// Lockes/unlockes nodes in a selected node group.
+    void lock(bool locked);
+
+    void updateQWidgetEmbedPos();
+
+    /// Saves node in a QJsonObject save file.
+    QJsonObject save() const;
+
+    /** @brief Setter for the NodeGroup object.
+     *  @param shared pointer to the node group.
+     */
+    void setNodeGroup(std::shared_ptr<NodeGroup> group);
+
+    /// Unsets NodeGroup, setting it to an empty pointer.
+    void unsetNodeGroup() { _nodeGroup = std::weak_ptr<NodeGroup>(); }
+
+    /// Getter for the NodeGroup object.
+    std::weak_ptr<NodeGroup> nodeGroup() const { return _nodeGroup; }
 
 protected:
     void paint(QPainter *painter,
@@ -60,19 +87,12 @@ protected:
     QVariant itemChange(GraphicsItemChange change, const QVariant &value) override;
 
     void mousePressEvent(QGraphicsSceneMouseEvent *event) override;
-
     void mouseMoveEvent(QGraphicsSceneMouseEvent *event) override;
-
     void mouseReleaseEvent(QGraphicsSceneMouseEvent *event) override;
-
     void hoverEnterEvent(QGraphicsSceneHoverEvent *event) override;
-
     void hoverLeaveEvent(QGraphicsSceneHoverEvent *event) override;
-
     void hoverMoveEvent(QGraphicsSceneHoverEvent *) override;
-
     void mouseDoubleClickEvent(QGraphicsSceneMouseEvent *event) override;
-
     void contextMenuEvent(QGraphicsSceneContextMenuEvent *event) override;
 
 
@@ -80,6 +100,7 @@ private:
     void embedQWidget();
 
     void setLockedState(NodeFlags flags);
+    void setLockedState();
 
 private:
     NodeId _nodeId;
@@ -88,7 +109,15 @@ private:
 
     NodeState _nodeState;
 
+    bool _locked;
+
+    bool _draggingIntoGroup;
+    GroupGraphicsObject *_possibleGroup;
+    QRectF _originalGroupSize;
+
     // either nullptr or owned by parent QGraphicsItem
     QGraphicsProxyWidget *_proxyWidget;
+
+    std::weak_ptr<NodeGroup> _nodeGroup{};
 };
 } // namespace QtNodes

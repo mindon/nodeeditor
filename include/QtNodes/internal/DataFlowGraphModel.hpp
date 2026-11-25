@@ -11,10 +11,14 @@
 #include <QJsonObject>
 
 #include <memory>
+#include <unordered_map>
+#include <QString>
 
 namespace QtNodes {
 
-class NODE_EDITOR_PUBLIC DataFlowGraphModel : public AbstractGraphModel, public Serializable
+class NODE_EDITOR_PUBLIC DataFlowGraphModel
+    : public AbstractGraphModel
+    , public Serializable
 {
     Q_OBJECT
 
@@ -79,16 +83,18 @@ public:
 
     QJsonObject saveNode(NodeId const) const override;
 
-    QJsonObject save() const override;
-
     void loadNode(QJsonObject const &nodeJson) override;
 
+    // From Serializable
+    QJsonObject save() const override;
+
+    // From Serializable
     void load(QJsonObject const &json) override;
 
     /**
-   * Fetches the NodeDelegateModel for the given `nodeId` and tries to cast the
-   * stored pointer to the given type
-   */
+     * Fetches the NodeDelegateModel for the given `nodeId` and tries to cast the
+     * stored pointer to the given type
+     */
     template<typename NodeDelegateModelType>
     NodeDelegateModelType *delegateModel(NodeId const nodeId)
     {
@@ -100,6 +106,9 @@ public:
 
         return model;
     }
+
+    /// Loops do not make any sense in uni-direction data propagation
+    bool loopsEnabled() const override { return false; }
 
 Q_SIGNALS:
     void inPortDataWasSet(NodeId const, PortType const, PortIndex const);
@@ -113,15 +122,15 @@ private:
 
 private Q_SLOTS:
     /**
-   * Fuction is called in three cases:
-   *
-   * - By underlying NodeDelegateModel when a node has new data to propagate.
-   *   @see DataFlowGraphModel::addNode
-   * - When a new connection is created.
-   *   @see DataFlowGraphModel::addConnection
-   * - When a node restored from JSON an needs to send data downstream.
-   *   @see DataFlowGraphModel::loadNode
-   */
+     * Fuction is called in three cases:
+     *
+     * - By underlying NodeDelegateModel when a node has new data to propagate.
+     *   @see DataFlowGraphModel::addNode
+     * - When a new connection is created.
+     *   @see DataFlowGraphModel::addConnection
+     * - When a node restored from JSON an needs to send data downstream.
+     *   @see DataFlowGraphModel::loadNode
+     */
     void onOutPortDataUpdated(NodeId const nodeId, PortIndex const portIndex);
 
     /// Function is called after detaching a connection.
@@ -139,6 +148,9 @@ private:
     mutable std::unordered_map<NodeId, NodeGeometryData> _nodeGeometryData;
 
     mutable std::unordered_map<NodeId, std::shared_ptr<QJsonObject>> _styles;
+
+    std::unordered_map<NodeId, QString> _labels;
+    std::unordered_map<NodeId, bool> _labelsVisible;
 };
 
 } // namespace QtNodes
