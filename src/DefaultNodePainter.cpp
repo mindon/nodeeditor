@@ -1,17 +1,19 @@
 #include "DefaultNodePainter.hpp"
 
-#include <cmath>
-
-#include <QtCore/QMargins>
-
 #include "AbstractGraphModel.hpp"
 #include "AbstractNodeGeometry.hpp"
 #include "BasicGraphicsScene.hpp"
 #include "ConnectionGraphicsObject.hpp"
 #include "ConnectionIdUtils.hpp"
+#include "DataFlowGraphModel.hpp"
+#include "NodeDelegateModel.hpp"
 #include "NodeGraphicsObject.hpp"
 #include "NodeState.hpp"
 #include "StyleCollection.hpp"
+
+#include <QtCore/QMargins>
+
+#include <cmath>
 
 namespace QtNodes {
 
@@ -31,7 +33,49 @@ void DefaultNodePainter::paint(QPainter *painter, NodeGraphicsObject &ngo) const
 
     drawEntryLabels(painter, ngo);
 
+    drawProcessingIndicator(painter, ngo);
+
     drawResizeRect(painter, ngo);
+
+    drawNodeLabel(painter, ngo);
+
+    drawValidationIcon(painter, ngo);
+
+    drawProgressValue(painter, ngo);
+}
+
+static void drawPaintedShadow(QPainter *painter,
+                              QRectF const &boundary,
+                              double radius,
+                              QColor const &shadowColor)
+{
+    // Fake a soft shadow without a graphics effect. Draw the node shape many times,
+    // from the largest and faintest layer to the smallest. The translucent layers add up,
+    // so the shadow is dark near the node and fades out. The node is drawn on top afterwards.
+    // The numbers are fitted to QGraphicsDropShadowEffect with offset 4 and blur radius 20.
+    // The halo must fit into the margins reserved by default geometries (20 px).
+    int const outerSpread = 15;          // the largest layer is 15 px bigger than the shape
+    int const innerSpread = -4;          // the smallest layer is 4 px smaller
+    double const shadowOffset = 4.0;     // the shadow is shifted right and down
+    double const innerLayerAlpha = 0.32; // opacity of the smallest layer, 1.0 = ShadowColor
+    int const layerCount = outerSpread - innerSpread + 1;
+
+    painter->save();
+    painter->setRenderHint(QPainter::Antialiasing, true);
+    painter->setPen(Qt::NoPen);
+
+    QRectF const shadowBody = boundary.translated(shadowOffset, shadowOffset);
+    for (int spread = outerSpread; spread >= innerSpread; --spread) {
+        double const t = double(outerSpread + 1 - spread) / layerCount;
+        QColor shade = shadowColor;
+        shade.setAlphaF(shade.alphaF() * innerLayerAlpha * t * t * t);
+        painter->setBrush(shade);
+        double const layerRadius = std::max(0.0, radius + spread);
+        painter->drawRoundedRect(shadowBody.adjusted(-spread, -spread, spread, spread),
+                                 layerRadius,
+                                 layerRadius);
+    }
+    painter->restore();
 }
 
 void DefaultNodePainter::drawNodeRect(QPainter *painter, NodeGraphicsObject &ngo) const
@@ -47,7 +91,28 @@ void DefaultNodePainter::drawNodeRect(QPainter *painter, NodeGraphicsObject &ngo
     QJsonDocument json = QJsonDocument::fromVariant(model.nodeData(nodeId, NodeRole::Style));
     NodeStyle nodeStyle(json.object());
 
-    auto color = ngo.isSelected() ? nodeStyle.SelectedBoundaryColor : nodeStyle.NormalBoundaryColor;
+    QVariant var = model.nodeData(nodeId, NodeRole::ValidationState);
+    bool invalid = false;
+
+    QColor color = ngo.isSelected() ? nodeStyle.SelectedBoundaryColor
+                                    : nodeStyle.NormalBoundaryColor;
+
+    if (var.canConvert<NodeValidationState>()) {
+        auto state = var.value<NodeValidationState>();
+        switch (state._state) {
+        case NodeValidationState::State::Error: {
+            invalid = true;
+            color = nodeStyle.ErrorColor;
+        } break;
+        case NodeValidationState::State::Warning: {
+            invalid = true;
+            color = nodeStyle.WarningColor;
+            break;
+        default:
+            break;
+        }
+        }
+    }
 
     if (ngo.nodeState().hovered()) {
         QPen p(color, nodeStyle.HoveredPenWidth);
@@ -57,11 +122,10 @@ void DefaultNodePainter::drawNodeRect(QPainter *painter, NodeGraphicsObject &ngo
         painter->setPen(p);
     }
 
-    if (nodeStyle.FillColor.value()) {
-        painter->setBrush(nodeStyle.FillColor);
+    if (invalid) {
+        painter->setBrush(color);
     } else {
         QLinearGradient gradient(QPointF(0.0, 0.0), QPointF(2.0, size.height()));
-
         gradient.setColorAt(0.0, nodeStyle.GradientColor0);
         gradient.setColorAt(0.10, nodeStyle.GradientColor1);
         gradient.setColorAt(0.90, nodeStyle.GradientColor2);
@@ -69,10 +133,13 @@ void DefaultNodePainter::drawNodeRect(QPainter *painter, NodeGraphicsObject &ngo
 
         painter->setBrush(gradient);
     }
-
     QRectF boundary(0, 0, size.width(), size.height());
 
     double const radius = nodeStyle.CornerRadius >= 0 ? nodeStyle.CornerRadius : 3.0;
+
+    if (nodeStyle.ShadowEnabled && nodeStyle.PaintedShadowEnabled)
+        drawPaintedShadow(painter, boundary, radius, nodeStyle.ShadowColor);
+
     painter->drawRoundedRect(boundary, radius, radius);
 }
 
@@ -91,11 +158,9 @@ void DefaultNodePainter::drawConnectionPoints(QPainter *painter, NodeGraphicsObj
     auto reducedDiameter = diameter * 0.6;
 
     for (PortType portType : {PortType::Out, PortType::In}) {
-        size_t const n = model
-                             .nodeData(nodeId,
-                                       (portType == PortType::Out) ? NodeRole::OutPortCount
-                                                                   : NodeRole::InPortCount)
-                             .toUInt();
+        auto portCountRole = (portType == PortType::Out) ? NodeRole::OutPortCount
+                                                         : NodeRole::InPortCount;
+        size_t const n = model.nodeData(nodeId, portCountRole).toUInt();
 
         for (PortIndex portIndex = 0; portIndex < n; ++portIndex) {
             QPointF p = geometry.portPosition(nodeId, portType, portIndex);
@@ -201,12 +266,21 @@ void DefaultNodePainter::drawNodeCaption(QPainter *painter, NodeGraphicsObject &
     if (!model.nodeData(nodeId, NodeRole::CaptionVisible).toBool())
         return;
 
+    QString const nickname = model.nodeData(nodeId, NodeRole::Label).toString();
     QString const name = model.nodeData(nodeId, NodeRole::Caption).toString();
 
     QFont f = painter->font();
-    f.setBold(true);
+    f.setBold(nickname.isEmpty());
+    f.setItalic(!nickname.isEmpty());
 
-    QPointF position = geometry.captionPosition(nodeId);
+    QFontMetricsF metrics(f);
+
+    QRectF bounding = metrics.boundingRect(name);
+    QRectF capRect = geometry.captionRect(nodeId);
+    QPointF capPos = geometry.captionPosition(nodeId);
+    double centerX = capPos.x() + capRect.width() / 2.0;
+
+    QPointF position(centerX - bounding.width() / 2.0, capPos.y());
 
     QJsonDocument json = QJsonDocument::fromVariant(model.nodeData(nodeId, NodeRole::Style));
     NodeStyle nodeStyle(json.object());
@@ -214,6 +288,45 @@ void DefaultNodePainter::drawNodeCaption(QPainter *painter, NodeGraphicsObject &
     painter->setFont(f);
     painter->setPen(nodeStyle.FontColor);
     painter->drawText(position, name);
+
+    f.setBold(false);
+    f.setItalic(false);
+    painter->setFont(f);
+}
+
+void DefaultNodePainter::drawNodeLabel(QPainter *painter, NodeGraphicsObject &ngo) const
+{
+    AbstractGraphModel &model = ngo.graphModel();
+    NodeId const nodeId = ngo.nodeId();
+    AbstractNodeGeometry &geometry = ngo.nodeScene()->nodeGeometry();
+
+    if (!model.nodeData(nodeId, NodeRole::LabelVisible).toBool())
+        return;
+
+    QString const nickname = model.nodeData(nodeId, NodeRole::Label).toString();
+
+    QFont f = painter->font();
+    f.setBold(true);
+    f.setItalic(false);
+
+    QFontMetricsF metrics(f);
+
+    QRectF bounding = metrics.boundingRect(nickname);
+    QRectF capRect = geometry.captionRect(nodeId);
+    QPointF capPos = geometry.captionPosition(nodeId);
+    double centerX = capPos.x() + capRect.width() / 2.0;
+
+    double textHeight = metrics.height();
+    double y = capPos.y() - textHeight - 2.0;
+
+    QPointF position(centerX - bounding.width() / 2.0, y);
+
+    QJsonDocument json = QJsonDocument::fromVariant(model.nodeData(nodeId, NodeRole::Style));
+    NodeStyle nodeStyle(json.object());
+
+    painter->setFont(f);
+    painter->setPen(nodeStyle.FontColor);
+    painter->drawText(position, nickname);
 
     f.setBold(false);
     painter->setFont(f);
@@ -270,6 +383,117 @@ void DefaultNodePainter::drawResizeRect(QPainter *painter, NodeGraphicsObject &n
 
         painter->drawEllipse(geometry.resizeHandleRect(nodeId));
     }
+}
+
+void DefaultNodePainter::drawProcessingIndicator(QPainter *painter, NodeGraphicsObject &ngo) const
+{
+    AbstractGraphModel &model = ngo.graphModel();
+    NodeId const nodeId = ngo.nodeId();
+
+    auto *dfModel = dynamic_cast<DataFlowGraphModel *>(&model);
+    if (!dfModel)
+        return;
+
+    auto *delegate = dfModel->delegateModel<NodeDelegateModel>(nodeId);
+    if (!delegate)
+        return;
+
+    // Skip if status is NoStatus
+    if (delegate->processingStatus() == NodeProcessingStatus::NoStatus)
+        return;
+
+    AbstractNodeGeometry &geometry = ngo.nodeScene()->nodeGeometry();
+
+    QSize size = geometry.size(nodeId);
+
+    QPixmap pixmap = delegate->processingStatusIcon();
+    if (pixmap.isNull())
+        return;
+
+    ProcessingIconStyle const &iconStyle = delegate->nodeStyle().processingIconStyle;
+
+    qreal iconSize = iconStyle._size;
+    qreal margin = iconStyle._margin;
+
+    // Determine position, avoiding conflict with resize handle
+    ProcessingIconPos pos = iconStyle._pos;
+    bool isResizable = model.nodeFlags(nodeId) & NodeFlag::Resizable;
+    if (isResizable && pos == ProcessingIconPos::BottomRight) {
+        pos = ProcessingIconPos::BottomLeft;
+    }
+
+    qreal x = margin;
+    if (pos == ProcessingIconPos::BottomRight) {
+        x = size.width() - iconSize - margin;
+    }
+
+    QRect r(x, size.height() - iconSize - margin, iconSize, iconSize);
+    painter->drawPixmap(r, pixmap);
+}
+
+void DefaultNodePainter::drawValidationIcon(QPainter *painter, NodeGraphicsObject &ngo) const
+{
+    AbstractGraphModel &model = ngo.graphModel();
+    NodeId const nodeId = ngo.nodeId();
+    AbstractNodeGeometry &geometry = ngo.nodeScene()->nodeGeometry();
+
+    QVariant var = model.nodeData(nodeId, NodeRole::ValidationState);
+    if (!var.canConvert<NodeValidationState>())
+        return;
+
+    auto state = var.value<NodeValidationState>();
+    if (state._state == NodeValidationState::State::Valid)
+        return;
+
+    QJsonDocument json = QJsonDocument::fromVariant(model.nodeData(nodeId, NodeRole::Style));
+    NodeStyle nodeStyle(json.object());
+
+    QSize size = geometry.size(nodeId);
+
+    QIcon icon(":/info-tooltip.svg");
+    QSize iconSize(16, 16);
+    QPixmap pixmap = icon.pixmap(iconSize);
+
+    QColor color = (state._state == NodeValidationState::State::Error) ? nodeStyle.ErrorColor
+                                                                       : nodeStyle.WarningColor;
+
+    QPainter imgPainter(&pixmap);
+    imgPainter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+    imgPainter.fillRect(pixmap.rect(), color);
+    imgPainter.end();
+
+    QPointF center(size.width(), 0.0);
+    center += QPointF(iconSize.width() / 2.0, -iconSize.height() / 2.0);
+
+    painter->drawPixmap(center.toPoint() - QPoint(iconSize.width() / 2, iconSize.height() / 2),
+                        pixmap);
+}
+
+void DefaultNodePainter::drawProgressValue(QPainter *painter, NodeGraphicsObject &ngo) const
+{
+    AbstractGraphModel &model = ngo.graphModel();
+    NodeId const nodeId = ngo.nodeId();
+    AbstractNodeGeometry &geometry = ngo.nodeScene()->nodeGeometry();
+
+    QString const nodeProgress = model.nodeData(nodeId, NodeRole::ProgressValue).toString();
+
+    QFont font = painter->font();
+    font.setBold(true);
+    font.setPointSize(7);
+    auto rect = QFontMetrics(font).boundingRect(nodeProgress);
+
+    QSize size = geometry.size(nodeId);
+    QPointF position(rect.width() / 1.5, size.height() - 1.0 * rect.height());
+
+    QJsonDocument json = QJsonDocument::fromVariant(model.nodeData(nodeId, NodeRole::Style));
+    NodeStyle nodeStyle(json.object());
+
+    painter->setFont(font);
+    painter->setPen(nodeStyle.FontColor);
+    painter->drawText(position, nodeProgress);
+
+    font.setBold(false);
+    painter->setFont(font);
 }
 
 } // namespace QtNodes

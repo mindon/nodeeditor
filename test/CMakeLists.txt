@@ -1,34 +1,54 @@
-if (Qt6_FOUND)
+if (USE_QT6)
   find_package(Qt6 COMPONENTS Test)
-  set(Qt Qt)
 else()
   find_package(Qt5 COMPONENTS Test)
-  set(Qt Qt5)
 endif()
+
+find_package(Catch2 3 REQUIRED)
 
 add_executable(test_nodes
   test_main.cpp
-  src/TestDragging.cpp
-  src/TestDataModelRegistry.cpp
-  src/TestFlowScene.cpp
-  src/TestNodeGraphicsObject.cpp
+  src/TestAbstractGraphModel.cpp
+  src/TestAbstractGraphModelSignals.cpp
+  src/TestDataFlowGraphModel.cpp
+  src/TestNodeDelegateModelRegistry.cpp
+  src/TestConnectionId.cpp
+  src/TestSerialization.cpp
+  src/TestUndoCommands.cpp
+  src/TestBasicGraphicsScene.cpp
+  src/TestNodeGroup.cpp
+  src/TestNodeNickname.cpp
+  src/TestEmbeddedWidgetOwnership.cpp
+  src/TestUIInteraction.cpp
+  src/TestNodeDrag.cpp
+  src/TestLockedNodePress.cpp
+  src/TestDataFlow.cpp
+  src/TestNodeValidation.cpp
+  src/TestCustomPainters.cpp
+  src/TestPaintedNodeShadows.cpp
+  src/TestNodeStyleRole.cpp
+  src/TestCopyPaste.cpp
+  src/TestSerializedItemCommands.cpp
+  src/TestZoomFeatures.cpp
+  src/TestLoopDetection.cpp
   include/ApplicationSetup.hpp
-  include/Stringify.hpp
-  include/StubNodeDataModel.hpp
+  include/TestGraphModel.hpp
+  include/UITestHelper.hpp
+  include/TestDataFlowNodes.hpp
+  include/TestDelegateModels.hpp
+  include/LockableModel.hpp
 )
 
 target_include_directories(test_nodes
   PRIVATE
-    ../src
-    ../include/internal
     include
 )
 
 target_link_libraries(test_nodes
   PRIVATE
     QtNodes::QtNodes
-    Catch2::Catch2
-    ${Qt}::Test
+    Catch2::Catch2WithMain
+    Qt${QT_VERSION_MAJOR}::Test
 )
 
 add_test(

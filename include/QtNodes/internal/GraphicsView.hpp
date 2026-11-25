@@ -2,7 +2,10 @@
 
 #include <QtWidgets/QGraphicsView>
 
+#include "Definitions.hpp"
 #include "Export.hpp"
+
+class QLineEdit;
 
 namespace QtNodes {
 
@@ -43,6 +46,8 @@ public:
 
     double getScale() const;
 
+    BasicGraphicsScene *getNodeScene() { return nodeScene(); }
+
 public Q_SLOTS:
     void scaleUp();
 
@@ -50,13 +55,17 @@ public Q_SLOTS:
 
     void setupScale(double scale);
 
-    void onDeleteSelectedObjects();
+    virtual void onDeleteSelectedObjects();
 
-    void onDuplicateSelectedObjects();
+    virtual void onDuplicateSelectedObjects();
 
-    void onCopySelectedObjects();
+    virtual void onCopySelectedObjects();
 
-    void onPasteObjects();
+    virtual void onPasteObjects();
+
+    void zoomFitAll();
+
+    void zoomFitSelected();
 
 Q_SIGNALS:
     void scaleChanged(double scale);
@@ -87,11 +96,15 @@ protected:
 private:
     QAction *_clearSelectionAction = nullptr;
     QAction *_deleteSelectionAction = nullptr;
+    QAction *_cutSelectionAction = nullptr;
     QAction *_duplicateSelectionAction = nullptr;
     QAction *_copySelectionAction = nullptr;
     QAction *_pasteAction = nullptr;
 
     QPointF _clickPos;
     ScaleRange _scaleRange;
+
+    QLineEdit *_labelEdit = nullptr;
+    NodeId _editingNodeId = InvalidNodeId;
 };
 } // namespace QtNodes

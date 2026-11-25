@@ -3,9 +3,12 @@
 #include "BasicGraphicsScene.hpp"
 #include "ConnectionGraphicsObject.hpp"
 #include "ConnectionIdUtils.hpp"
+#include "ConnectionIdHash.hpp"
 #include "Definitions.hpp"
+#include "GroupGraphicsObject.hpp"
 #include "NodeGraphicsObject.hpp"
 
+#include <unordered_set>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QMimeData>
@@ -13,9 +16,15 @@
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QGraphicsObject>
 
-#include <typeinfo>
-
 namespace QtNodes {
+
+// The library writes the node id itself. A model may not store it in saveNode().
+static QJsonObject saveNodeWithId(AbstractGraphModel const &graphModel, NodeId const nodeId)
+{
+    QJsonObject json = graphModel.saveNode(nodeId);
+    json["id"] = static_cast<qint64>(nodeId);
+    return json;
+}
 
 static QJsonObject serializeSelectedItems(BasicGraphicsScene *scene)
 {
@@ -24,29 +33,79 @@ static QJsonObject serializeSelectedItems(BasicGraphicsScene *scene)
     auto &graphModel = scene->graphModel();
 
     std::unordered_set<NodeId> selectedNodes;
+    std::unordered_set<ConnectionId> selectedConnections;
 
     QJsonArray nodesJsonArray;
-
-    for (QGraphicsItem *item : scene->selectedItems()) {
-        if (auto n = qgraphicsitem_cast<NodeGraphicsObject *>(item)) {
-            nodesJsonArray.append(graphModel.saveNode(n->nodeId()));
-
-            selectedNodes.insert(n->nodeId());
-        }
-    }
-
+    QJsonArray groupsJsonArray;
     QJsonArray connJsonArray;
 
-    for (QGraphicsItem *item : scene->selectedItems()) {
-        if (auto c = qgraphicsitem_cast<ConnectionGraphicsObject *>(item)) {
-            auto const &cid = c->connectionId();
+    auto appendNode = [&](NodeGraphicsObject *node) {
+        if (!node)
+            return;
 
-            if (selectedNodes.count(cid.outNodeId) > 0 && selectedNodes.count(cid.inNodeId) > 0) {
-                connJsonArray.append(toJson(cid));
+        auto const inserted = selectedNodes.insert(node->nodeId());
+        if (inserted.second) {
+            nodesJsonArray.append(saveNodeWithId(graphModel, node->nodeId()));
+        }
+    };
+
+    for (QGraphicsItem *item : scene->selectedItems()) {
+        if (auto group = qgraphicsitem_cast<GroupGraphicsObject *>(item)) {
+            for (auto *node : group->group().childNodes()) {
+                appendNode(node);
             }
         }
     }
 
+    for (QGraphicsItem *item : scene->selectedItems()) {
+        if (auto ngo = qgraphicsitem_cast<NodeGraphicsObject *>(item)) {
+            appendNode(ngo);
+        }
+    }
+
+    for (QGraphicsItem *item : scene->selectedItems()) {
+        if (auto groupGo = qgraphicsitem_cast<GroupGraphicsObject *>(item)) {
+            auto &group = groupGo->group();
+
+            QJsonObject groupJson;
+            groupJson["id"] = static_cast<qint64>(group.id());
+            groupJson["name"] = group.name();
+
+            QJsonArray nodeIdsJson;
+            for (NodeGraphicsObject *node : group.childNodes()) {
+                nodeIdsJson.append(static_cast<qint64>(node->nodeId()));
+            }
+
+            groupJson["nodes"] = nodeIdsJson;
+            groupsJsonArray.append(groupJson);
+        }
+    }
+
+    auto appendConnection = [&](ConnectionId const &connectionId) {
+        if (selectedNodes.count(connectionId.outNodeId) == 0
+            || selectedNodes.count(connectionId.inNodeId) == 0) {
+            return;
+        }
+
+        auto const inserted = selectedConnections.insert(connectionId);
+        if (inserted.second) {
+            connJsonArray.append(toJson(connectionId));
+        }
+    };
+
+    for (NodeId nodeId : selectedNodes) {
+        for (auto const &connectionId : graphModel.allConnectionIds(nodeId)) {
+            appendConnection(connectionId);
+        }
+    }
+
+    for (QGraphicsItem *item : scene->selectedItems()) {
+        if (auto c = qgraphicsitem_cast<ConnectionGraphicsObject *>(item)) {
+            appendConnection(c->connectionId());
+        }
+    }
+
+    serializedScene["groups"] = groupsJsonArray;
     serializedScene["nodes"] = nodesJsonArray;
     serializedScene["connections"] = connJsonArray;
 
@@ -64,9 +123,12 @@ static void insertSerializedItems(QJsonObject const &json, BasicGraphicsScene *s
 
         graphModel.loadNode(obj);
 
-        auto id = obj["id"].toInt();
-        scene->nodeGraphicsObject(id)->setZValue(1.0);
-        scene->nodeGraphicsObject(id)->setSelected(true);
+        // The model may not restore the node, for example with the default loadNode().
+        NodeId const id = jsonValueToUInt32(obj["id"]);
+        if (auto *ngo = scene->nodeGraphicsObject(id)) {
+            ngo->setZValue(1.0);
+            ngo->setSelected(true);
+        }
     }
 
     QJsonArray const &connJsonArray = json["connections"].toArray();
@@ -79,7 +141,30 @@ static void insertSerializedItems(QJsonObject const &json, BasicGraphicsScene *s
         // Restore the connection
         graphModel.addConnection(connId);
 
-        scene->connectionGraphicsObject(connId)->setSelected(true);
+        if (auto *cgo = scene->connectionGraphicsObject(connId))
+            cgo->setSelected(true);
+    }
+
+    if (json.contains("groups")) {
+        QJsonArray groupsJsonArray = json["groups"].toArray();
+
+        for (const QJsonValue &groupValue : groupsJsonArray) {
+            QJsonObject groupJson = groupValue.toObject();
+
+            QString name = QString("Group %1").arg(NodeGroup::groupCount());
+            QJsonArray nodeIdsJson = groupJson["nodes"].toArray();
+
+            std::vector<NodeGraphicsObject *> groupNodes;
+
+            for (const QJsonValue &idVal : nodeIdsJson) {
+                NodeId nodeId = jsonValueToUInt32(idVal);
+                if (auto *ngo = scene->nodeGraphicsObject(nodeId)) {
+                    groupNodes.push_back(ngo);
+                }
+            }
+
+            scene->createGroup(groupNodes, name);
+        }
     }
 }
 
@@ -99,7 +184,7 @@ static void deleteSerializedItems(QJsonObject &sceneJson, AbstractGraphModel &gr
 
     for (QJsonValueRef node : nodesJsonArray) {
         QJsonObject nodeJson = node.toObject();
-        graphModel.deleteNode(nodeJson["id"].toInt());
+        graphModel.deleteNode(jsonValueToUInt32(nodeJson["id"]));
     }
 }
 
@@ -140,7 +225,7 @@ CreateCommand::CreateCommand(BasicGraphicsScene *scene,
 void CreateCommand::undo()
 {
     QJsonArray nodesJsonArray;
-    nodesJsonArray.append(_scene->graphModel().saveNode(_nodeId));
+    nodesJsonArray.append(saveNodeWithId(_scene->graphModel(), _nodeId));
     _sceneJson["nodes"] = nodesJsonArray;
 
     _scene->graphModel().deleteNode(_nodeId);
@@ -176,23 +261,65 @@ DeleteCommand::DeleteCommand(BasicGraphicsScene *scene)
     QJsonArray nodesJsonArray;
     // Delete the nodes; this will delete many of the connections.
     // Selected connections were already deleted prior to this loop,
+
+    std::unordered_set<NodeId> processedNodes;
+
+    auto appendNode = [&](NodeGraphicsObject *node) {
+        if (!node)
+            return;
+
+        auto const inserted = processedNodes.insert(node->nodeId());
+        if (!inserted.second)
+            return;
+
+        for (auto const &cid : graphModel.allConnectionIds(node->nodeId())) {
+            connJsonArray.append(toJson(cid));
+        }
+
+        nodesJsonArray.append(saveNodeWithId(graphModel, node->nodeId()));
+    };
+
+    QJsonArray groupsJsonArray;
+
     for (QGraphicsItem *item : _scene->selectedItems()) {
-        if (auto n = qgraphicsitem_cast<NodeGraphicsObject *>(item)) {
-            // saving connections attached to the selected nodes
-            for (auto const &cid : graphModel.allConnectionIds(n->nodeId())) {
-                connJsonArray.append(toJson(cid));
+        if (auto groupGo = qgraphicsitem_cast<GroupGraphicsObject *>(item)) {
+            auto &groupData = groupGo->group();
+
+            QJsonArray groupNodeIdsJsonArray;
+            for (NodeGraphicsObject *node : groupData.childNodes()) {
+                appendNode(node);
+                groupNodeIdsJsonArray.append(static_cast<qint64>(node->nodeId()));
             }
 
-            nodesJsonArray.append(graphModel.saveNode(n->nodeId()));
+            QJsonObject groupJson;
+            groupJson["id"] = static_cast<qint64>(groupData.id());
+            groupJson["name"] = groupData.name();
+            groupJson["nodes"] = groupNodeIdsJsonArray;
+            groupsJsonArray.append(groupJson);
+        }
+    }
+
+    for (QGraphicsItem *item : _scene->selectedItems()) {
+        if (auto group = qgraphicsitem_cast<GroupGraphicsObject *>(item)) {
+            for (auto *node : group->group().childNodes()) {
+                appendNode(node);
+            }
+        }
+    }
+
+    for (QGraphicsItem *item : _scene->selectedItems()) {
+        if (auto n = qgraphicsitem_cast<NodeGraphicsObject *>(item)) {
+            appendNode(n);
         }
     }
 
     // If nothing is deleted, cancel this operation
-    if (connJsonArray.isEmpty() && nodesJsonArray.isEmpty())
+    if (connJsonArray.isEmpty() && nodesJsonArray.isEmpty() && groupsJsonArray.isEmpty())
         setObsolete(true);
 
     _sceneJson["nodes"] = nodesJsonArray;
     _sceneJson["connections"] = connJsonArray;
+    _sceneJson["groups"] = groupsJsonArray;
 }
 
 void DeleteCommand::undo()
@@ -333,7 +460,7 @@ QJsonObject PasteCommand::makeNewNodeIdsInScene(QJsonObject const &sceneJson)
     for (QJsonValueRef node : nodesJsonArray) {
         QJsonObject nodeJson = node.toObject();
 
-        NodeId oldNodeId = nodeJson["id"].toInt();
+        NodeId oldNodeId = jsonValueToUInt32(nodeJson["id"]);
 
         NodeId newNodeId = graphModel.newNodeId();
 
@@ -365,6 +492,28 @@ QJsonObject PasteCommand::makeNewNodeIdsInScene(QJsonObject const &sceneJson)
 
     newSceneJson["nodes"] = newNodesJsonArray;
     newSceneJson["connections"] = newConnJsonArray;
+
+    if (sceneJson.contains("groups")) {
+        QJsonArray groupsJsonArray = sceneJson["groups"].toArray();
+        QJsonArray newGroupsJsonArray;
+
+        for (const QJsonValue &groupVal : groupsJsonArray) {
+            QJsonObject groupJson = groupVal.toObject();
+            QJsonArray nodeIdsJson = groupJson["nodes"].toArray();
+
+            QJsonArray newNodeIdsJson;
+            for (const QJsonValue &idVal : nodeIdsJson) {
+                NodeId oldId = jsonValueToUInt32(idVal);
+                NodeId newId = mapNodeIds[oldId];
+                newNodeIdsJson.append(static_cast<qint64>(newId));
+            }
+
+            groupJson["nodes"] = newNodeIdsJson;
+            newGroupsJsonArray.append(groupJson);
+        }
+
+        newSceneJson["groups"] = newGroupsJsonArray;
+    }
 
     return newSceneJson;
 }
@@ -413,17 +562,28 @@ MoveNodeCommand::MoveNodeCommand(BasicGraphicsScene *scene, QPointF const &diff)
     : _scene(scene)
     , _diff(diff)
 {
-    _selectedNodes.clear();
     for (QGraphicsItem *item : _scene->selectedItems()) {
         if (auto n = qgraphicsitem_cast<NodeGraphicsObject *>(item)) {
-            _selectedNodes.insert(n->nodeId());
+            _nodeIds.insert(n->nodeId());
         }
     }
 }
 
+MoveNodeCommand::MoveNodeCommand(BasicGraphicsScene *scene,
+                                 std::unordered_set<NodeId> const &nodeIds,
+                                 QPointF const &diff)
+    : _scene(scene)
+    , _nodeIds(nodeIds)
+    , _diff(diff)
+{}
+
 void MoveNodeCommand::undo()
 {
-    for (auto nodeId : _selectedNodes) {
+    for (auto nodeId : _nodeIds) {
+        // The node may have been deleted outside the undo stack.
+        if (!_scene->graphModel().nodeExists(nodeId))
+            continue;
+
         auto oldPos = _scene->graphModel().nodeData(nodeId, NodeRole::Position).value<QPointF>();
 
         oldPos -= _diff;
@@ -434,7 +594,11 @@ void MoveNodeCommand::undo()
 
 void MoveNodeCommand::redo()
 {
-    for (auto nodeId : _selectedNodes) {
+    for (auto nodeId : _nodeIds) {
+        // The node may have been deleted outside the undo stack.
+        if (!_scene->graphModel().nodeExists(nodeId))
+            continue;
+
         auto oldPos = _scene->graphModel().nodeData(nodeId, NodeRole::Position).value<QPointF>();
 
         oldPos += _diff;
@@ -452,7 +616,7 @@ bool MoveNodeCommand::mergeWith(QUndoCommand const *c)
 {
     auto mc = static_cast<MoveNodeCommand const *>(c);
 
-    if (_selectedNodes == mc->_selectedNodes) {
+    if (_nodeIds == mc->_nodeIds) {
         _diff += mc->_diff;
         return true;
     }

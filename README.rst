@@ -1,7 +1,8 @@
 QtNodes
 #######
 
-https://github.com/paceholder/nodeeditor/actions/workflows/cmake_build.yml/badge.svg
+.. image:: https://github.com/paceholder/nodeeditor/actions/workflows/cmake_build.yml/badge.svg
+   :target: https://github.com/paceholder/nodeeditor/actions/workflows/cmake_build.yml
 
 Introduction
 ============
@@ -33,8 +34,9 @@ Warning
 Branches
 --------
 
-There are branchses ``v2`` and ``v3`` for versions ``2.x.x`` and ``3.x``
-respectively. The branch ``master`` contains the latest dev state.
+There is a branch ``v3`` for version ``3.x``. The branch ``master`` contains the latest
+dev state. Older versions are available as tags: ``1.0`` and ``2.*`` (the last ``2.x.x``
+release is ``2.2.4``).
 
 
 .. contents:: Navigation
@@ -73,7 +75,7 @@ Dependencies
 ------------
 
 * Qt >5.15
-* CMake 3.8
+* CMake 3.13
 * Catch2
 
 
@@ -103,6 +105,13 @@ Current State (v3)
 Building
 ========
 
+C++ standard
+------------
+
+The sources use C++17 and Qt 6 requires it, so build with C++17 or newer. QtNodes does not
+impose a standard on projects that include it. Your project sets it, for example with
+``set(CMAKE_CXX_STANDARD 17)``, so that all of its targets stay consistent.
+
 Set this option to false if you want to build with Qt5 version instead of Qt6:
 
 ::
@@ -112,6 +121,15 @@ Set this option to false if you want to build with Qt5 version instead of Qt6:
    mkdir build && cd build && cmake .. -DUSE_QT6=on
    or
    mkdir build && cd build && cmake .. -DUSE_QT6=off
+
+For building a static lib use:
+
+::
+
+    cmake .. -DBUILD_SHARED_LIBS=off
+
+See the "Shared and static library" section of the installation docs
+(``docs/getting-started/installation.rst``) for what the library defines and what to avoid.
 
 Linux
 -----
@@ -130,10 +148,13 @@ Qt Creator
 ----------
 
 1. Open `CMakeLists.txt` as project.
-2. If you don't have the `Catch2` library installed, go to `Build Settings`, disable the checkbox `BUILD_TESTING`.
-3. `Build -> Run CMake`
-4. `Build -> Build All`
-5. Click the button `Run`
+2. `Build -> Run CMake`
+3. `Build -> Build All`
+4. Click the button `Run`
+
+.. note::
+   The project includes unit tests built with Catch2. If you don't have Catch2 installed, 
+   you can disable testing by setting `-DBUILD_TESTING=OFF` in CMake configuration.
 
 
 With Cmake using `vcpkg`
@@ -147,12 +168,45 @@ With Cmake using `vcpkg`
    -DCMAKE_TOOLCHAIN_FILE=<vcpkg_dir>/scripts/buildsystems/scripts/buildsystems/vcpkg.cmake
 
 
+Testing
+=======
+
+QtNodes includes a comprehensive unit test suite built with Catch2.
+
+**Running Tests**
+
+From the build directory:
+
+::
+
+    # Build tests
+    make test_nodes
+    
+    # Run all tests
+    ./bin/test_nodes
+    
+    # Run specific categories
+    ./bin/test_nodes "[core]"        # Core functionality tests
+    ./bin/test_nodes "[graphics]"    # Graphics system tests
+
+**Test Coverage**
+
+* Core model operations (node CRUD, connections)
+* Signal emission verification (AbstractGraphModel signals)
+* Serialization (JSON save/load) 
+* Undo system integration
+* Graphics scene management
+* Connection utilities
+
+For detailed testing documentation, see the `Testing Guide <https://qtnodes.readthedocs.io/en/latest/testing.html>`_.
+
+
 Help Needed
 ===========
 
-#. Python wrappring using PySide.
+#. Python wrapping using PySide.
 #. QML frontend.
-#. Wirting a ClangFormat config.
+#. Writing a ClangFormat config.
 
 Any suggestions are welcome!
 
@@ -177,7 +231,7 @@ Contribution
    #. Describe your issue in details
    #. Provide some use cases.
 
-#. I maintain this probject in my free time, when I am not busy with my work or
+#. I maintain this project in my free time, when I am not busy with my work or
    my family. **If I do not react or do not answer for too long, please ping
    me**.
 
@@ -187,14 +241,14 @@ Citing
 
 ::
 
-    Dmitry Pinaev et al, Qt Nodes, (2022), GitHub repository, https://github.com/paceholder/nodeeditor
+    Dmitry Pinaev et al, Qt Nodes, (2013-2025), GitHub repository, https://github.com/paceholder/nodeeditor
 
 BibTeX::
 
-    @misc{Pinaev2022,
+    @misc{Pinaev2025,
       author = {Dmitry Pinaev et al},
       title = {QtNodes. Node Editor},
-      year = {2017},
+      year = {2025},
       publisher = {GitHub},
       journal = {GitHub repository},
       howpublished = {\url{https://github.com/paceholder/nodeeditor}},
@@ -245,7 +299,7 @@ every automotive developer. Thanks to modularity it is easy to implement new,
 custom features.
 
 
-.. image:: docs/_static/showcase_CANdevStudio.png
+.. image:: assets/showcase-candevstudio.png
 
 
 Chigraph
@@ -254,7 +308,7 @@ Chigraph
 `Chigraph <https://github.com/chigraph/chigraph>`_ is a visual programming
 language for beginners that is unique in that it is an intuitive flow graph:
 
-.. image:: docs/_static/chigraph.png
+.. image:: assets/chigraph.png
 
 
 It features easy bindings to C/C++, package management, and a cool interface.
@@ -267,4 +321,4 @@ Spkgen particle editor
 particles engine that uses a node-based interface to create particles effects for
 games
 
-.. image:: docs/_static/spkgen.png
+.. image:: assets/spkgen.png
